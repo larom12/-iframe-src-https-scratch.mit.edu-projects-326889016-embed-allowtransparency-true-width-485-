@@ -1,118 +1,139 @@
-#include<Servo.h>//header file for servo
-#include <LiquidCrystal.h>//header file for LCD
+import asyncio
+from typing import Annotated
+
+from livekit import agents, rtc
+from livekit.agents import JobContext, WorkerOptions, cli, tokenize, tts
+from livekit.agents.llm import (
+    ChatContext,
+    ChatImage,
+    ChatMessage,
+)
+from livekit.agents.voice_assistant import VoiceAssistant
+from livekit.plugins import deepgram, openai, silero
 
 
-//first of all we will use the  TMP36 which is a temperature sensor that outputs
-//a voltage that's proportional to the ambient temperature.
+class AssistantFunction(agents.llm.FunctionContext):
+    """This class is used to define functions that will be called by the assistant."""
 
-// We'll use analog input 0 to measure the temperature sensor's signal pin.
-//Temparature Sensor
-const int temperaturePin = 0; //The output of tmp36 is connected to A0 of arduino
+    @agents.llm.ai_callable(
+        description=(
+            "Called when asked to evaluate something that would require vision capabilities,"
+            "for example, an image, video, or the webcam feed."
+        )
+    )
+    async def image(
+        self,
+        user_msg: Annotated[
+            str,
+            agents.llm.TypeInfo(
+                description="The user message that triggered this function"
+            ),
+        ],
+    ):
+        print(f"Message triggering vision capabilities: {user_msg}")
+        return None
 
-//buzzer
-const int buzzer = 12; //buzzer is connected to D12 on the arduino
 
-//Gas Sensor
-int gasSensorPin=A1;//Gas sensor output is connected to A1 of Arduino
-int sensorval;//For storing the value sensed by gas sensor
+async def get_video_track(room: rtc.Room):
+    """Get the first video track from the room. We'll use this track to process images."""
 
-//Doors
-Servo servo1,servo2;
-int servo1Pin=11;
-int servo2Pin=10;
+    video_track = asyncio.Future[rtc.RemoteVideoTrack]()
 
-//RGB LED
-int red_led=9;//Red terminal of RGB LED is connected to D9 of Arduino
-int green_led=8;//Green terminal of RGB LED is connected to D8 of Arduino
+    for _, participant in room.remote_participants.items():
+        for _, track_publication in participant.track_publications.items():
+            if track_publication.track is not None and isinstance(
+                track_publication.track, rtc.RemoteVideoTrack
+            ):
+                video_track.set_result(track_publication.track)
+                print(f"Using video track {track_publication.track.sid}")
+                break
 
-//LCD
-LiquidCrystal lcd(7, 6, 2, 3, 4, 5);//Sets the interfacing pins on Arduino that are connected to LCD
-//(rs, enable, d4, d5, d6, d7)
-//7-Rs,6-E(Enable), 5,4,3,2 are the inputs->4 bit mode
+    return await video_track
 
-//reset button
-int buttonstate = 0;
-const int resetbtn = 13;
-int repeat = 0;
 
-void setup()
-{
-  pinMode(buzzer, OUTPUT);//set the pin connected to the buzzer as an output
-  
-  servo1.attach(servo1Pin);
-  servo2.attach(servo2Pin);
-  servo1.write(90);//Intially both doors are closed(i.e, 90 degrees)
-  servo2.write(90);
-  
-  pinMode(red_led,OUTPUT);
-  pinMode(green_led,OUTPUT);
-  pinMode(resetbtn,INPUT);
-  //Serial.begin(9600);
-  
-  lcd.begin(16,2);//initialisation of 16*2 LCD
-}
+async def entrypoint(ctx: JobContext):
+    await ctx.connect()
+    print(f"Room name: {ctx.room.name}")
 
-void loop()
-{
-  	//for buzzer and tmp36 temp sensor
- 	float voltage, degreesC;
-  	voltage = getVoltage(temperaturePin);
-	degreesC = (voltage - 0.5) * 100.0;
-	
-  	sensorval=analogRead(gasSensorPin);
-  	//Serial.print(sensorval);
- 	buttonstate = digitalRead(resetbtn);
-  
-  if(buttonstate == HIGH) {
-  	repeat = 0;
-  }  
-  
-  	
-  	if(degreesC>37 || sensorval>700 || repeat == 1)
-  	{
-      repeat = 1;
-      
-      tone(buzzer, 800, 800);
-      
-      servo1.write(0);
-      servo2.write(0);
-      
-      lcd.clear();
-      lcd.setCursor(0,0);//row 0 column 0
-  	  lcd.print("DANGER!!");
-      lcd.setCursor(0,1);//row 1 column 0
-      lcd.print("VACATE Building!");
-      
-      digitalWrite(red_led,HIGH);
-      digitalWrite(green_led,LOW);
-      
-      delay(1000);
-      tone(buzzer,600,800);
-      digitalWrite(red_led,LOW);
-      delay(400);
-  	}
-  	else{
-      servo1.write(90);
-      servo2.write(90);
-      delay(1000);
-      
-      digitalWrite(green_led,HIGH);
-      digitalWrite(red_led,LOW);
-      
-      lcd.clear();
-  	  lcd.setCursor(0,0);//column 0 row 0
-  	  lcd.print("SAFE");
-      lcd.setCursor(6,0);//column 6 row 0
-      lcd.print(degreesC);
-      lcd.print("C");
-      lcd.setCursor(0,1);
-      lcd.print("Gas Conc.:");
-      lcd.print(sensorval);
-  }
-  
-}
-float getVoltage(int pin)
-{
-  
-  return (analogRead(pin) * 0.004882814);
-}
+    chat_context = ChatContext(
+        messages=[
+            ChatMessage(
+                role="system",
+                content=(
+                    "Your name is Alloy. You are a funny, witty bot. Your interface with users will be voice and vision."
+                    "Respond with short and concise answers. Avoid using unpronouncable punctuation or emojis."
+                ),
+            )
+        ]
+    )
+
+    gpt = openai.LLM(model="gpt-4o")
+
+    # Since OpenAI does not support streaming TTS, we'll use it with a StreamAdapter
+    # to make it compatible with the VoiceAssistant
+    openai_tts = tts.StreamAdapter(
+        tts=openai.TTS(voice="alloy"),
+        sentence_tokenizer=tokenize.basic.SentenceTokenizer(),
+    )
+
+    latest_image: rtc.VideoFrame | None = None
+
+    assistant = VoiceAssistant(
+        vad=silero.VAD.load(),  # We'll use Silero's Voice Activity Detector (VAD)
+        stt=deepgram.STT(),  # We'll use Deepgram's Speech To Text (STT)
+        llm=gpt,
+        tts=openai_tts,  # We'll use OpenAI's Text To Speech (TTS)
+        fnc_ctx=AssistantFunction(),
+        chat_ctx=chat_context,
+    )
+
+    chat = rtc.ChatManager(ctx.room)
+
+    async def _answer(text: str, use_image: bool = False):
+        """
+        Answer the user's message with the given text and optionally the latest
+        image captured from the video track.
+        """
+        content: list[str | ChatImage] = [text]
+        if use_image and latest_image:
+            content.append(ChatImage(image=latest_image))
+
+        chat_context.messages.append(ChatMessage(role="user", content=content))
+
+        stream = gpt.chat(chat_ctx=chat_context)
+        await assistant.say(stream, allow_interruptions=True)
+
+    @chat.on("message_received")
+    def on_message_received(msg: rtc.ChatMessage):
+        """This event triggers whenever we get a new message from the user."""
+
+        if msg.message:
+            asyncio.create_task(_answer(msg.message, use_image=False))
+
+    @assistant.on("function_calls_finished")
+    def on_function_calls_finished(called_functions: list[agents.llm.CalledFunction]):
+        """This event triggers when an assistant's function call completes."""
+
+        if len(called_functions) == 0:
+            return
+
+        user_msg = called_functions[0].call_info.arguments.get("user_msg")
+        if user_msg:
+            asyncio.create_task(_answer(user_msg, use_image=True))
+
+    assistant.start(ctx.room)
+
+    await asyncio.sleep(1)
+    await assistant.say("Hi there! How can I help?", allow_interruptions=True)
+
+    while ctx.room.connection_state == rtc.ConnectionState.CONN_CONNECTED:
+        video_track = await get_video_track(ctx.room)
+
+        async for event in rtc.VideoStream(video_track):
+            # We'll continually grab the latest image from the video track
+            # and store it in a variable.
+            latest_image = event.frame
+
+
+if __name__ == "__main__":
+    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
